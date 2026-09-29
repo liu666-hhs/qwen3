@@ -1,0 +1,237 @@
+import os
+
+os.environ["HF_HOME"] = r"D:\huggingface"
+# 关闭 XET
+os.environ["HF_HUB_DISABLE_XET"] = "1"
+
+# 确保没有进入离线模式
+os.environ.pop("HF_HUB_OFFLINE", None)
+os.environ.pop("TRANSFORMERS_OFFLINE", None)
+os.environ.pop("HF_DATASETS_OFFLINE", None)
+os.environ["UNSLOTH_DISABLE_SENTENCEPIECE"] = "0"
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+os.environ["TEMP"] = r"D:\temp"
+os.environ["TMP"] = r"D:\temp"
+os.environ["TRITON_CACHE_DIR"] = r"D:\triton_cache"
+os.environ["TORCHINDUCTOR_CACHE_DIR"] = r"D:\torch_cache"
+import datasets
+import sys
+import logging
+import pandas as pd
+import numpy as np
+import unsloth
+import torch
+import evaluate
+from datasets import Dataset, concatenate_datasets
+from sklearn.model_selection import train_test_split
+
+from unsloth import FastLanguageModel, train_on_responses_only
+from transformers import TrainingArguments, AutoModelForSequenceClassification
+from trl import SFTTrainer
+
+# --- 日志设置 ---
+program = os.path.basename(sys.argv[0])
+logger = logging.getLogger(program)
+logging.basicConfig(format='%(asctime)s: %(levelname)s: %(message)s')
+logging.root.setLevel(level=logging.INFO)
+# logger.info(...) 移动到 main 内部
+
+# --- Alpaca 指令模版 ---
+alpaca_prompt = """Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
+
+### Instruction:
+Analyze the sentiment of the following movie review. Respond with 'positive' or 'negative'.
+
+### Input:
+{}
+
+### Response:
+{}"""
+
+
+# --- 数据格式化函数 ---
+def formatting_prompts_func(examples):
+    inputs = examples["sentence"]
+    labels = examples["label"]
+    outputs_text = []
+
+    global EOS_TOKEN
+    if EOS_TOKEN is None:
+        raise ValueError("EOS_TOKEN is not set. Make sure tokenizer is loaded first.")
+
+    for input_text, label in zip(inputs, labels):
+        label_text = "positive" if label == 1 else "negative"
+        text = alpaca_prompt.format(input_text, label_text) + EOS_TOKEN
+        outputs_text.append(text)
+
+    return {"text": outputs_text}
+
+def formatting_prompts_func1(examples):
+    inputs = examples["sentence"]
+    labels = examples["label"]
+    outputs_text = []
+
+    global EOS_TOKEN
+    if EOS_TOKEN is None:
+        raise ValueError("EOS_TOKEN is not set. Make sure tokenizer is loaded first.")
+
+    for input_text, label in zip(inputs, labels):
+        text = alpaca_prompt.format(input_text) + EOS_TOKEN
+        outputs_text.append(text)
+
+    return {"text": outputs_text}
+# --- 主执行程序 ---
+if __name__ == '__main__':
+
+    logger.info(r"running %s" % ''.join(sys.argv))
+
+    # --- 1. 加载数据 ---
+    logger.info("Loading data...")
+    train_dataset =datasets.Dataset.from_file(r"D:\liu\Desktop\新建文件夹 (4)\glue-train.arrow")
+    test_dict=datasets.Dataset.from_file(r"D:\liu\Desktop\新建文件夹 (4)\glue-test.arrow")
+    val_dataset=datasets.Dataset.from_file(r"D:\liu\Desktop\新建文件夹 (4)\glue-validation.arrow")
+    print("ddddddddddddddddddddddddddddddddddddddddddddddd")
+    print(len(val_dataset))
+    # --- 2. 加载模型和 Tokenizer ---
+    logger.info("Loading Qwen model...")
+
+    model_name = "unsloth/Qwen3-4B-base"
+    print("ddddddddddddddddddddddddddddddddddddddddddd")
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=model_name,
+        load_in_4bit=True,
+        max_seq_length=2048,
+        dtype=None,
+        local_files_only=False,
+    )
+    print("fffffffffffffffffffffffffffffffffffffffffffff")
+    EOS_TOKEN = tokenizer.eos_token
+    logger.info(f"EOS token set to: {EOS_TOKEN}")
+
+    # --- 3. PEFT (LoRA) 设置 ---
+    logger.info("Setting up PEFT...")
+    model = FastLanguageModel.get_peft_model(
+        model,
+        r=16,
+        lora_alpha=32,
+        lora_dropout=0,
+        bias="none",
+        random_state=3407,
+        use_gradient_checkpointing="unsloth",
+        target_modules=[
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+],
+    )
+    print("ddddddddddddddddddddddddddddddddd")
+    logger.info("Model parameters:" + str(sum(p.numel() for p in model.parameters())))
+
+    # --- 4. 格式化数据集 ---
+    logger.info("Formatting datasets...")
+    train_dataset = train_dataset.map(formatting_prompts_func, batched=True, )
+    neg = train_dataset.filter(lambda x: x["label"] == 0)
+    pos = train_dataset.filter(lambda x: x["label"] == 1)
+
+# 各随机取 512 个
+    neg = neg.shuffle(seed=42).select(range(1024))
+    pos = pos.shuffle(seed=42).select(range(1024))
+
+# 合并
+    train_1024 = concatenate_datasets([neg, pos])
+    train_1024=train_1024.shuffle(seed=43)
+    print(train_dataset[0])
+    # --- 5. 训练参数 ---
+    logger.info("Setting up Training Arguments...")
+    training_args = TrainingArguments(
+        output_dir="outputs_qwen",
+        per_device_train_batch_size=16,
+        # gradient_accumulation_steps=4,
+        warmup_ratio=0.05,
+        num_train_epochs=2,
+        learning_rate=5e-5,
+        fp16=not torch.cuda.is_bf16_supported(),
+        bf16=torch.cuda.is_bf16_supported(),
+        logging_steps=10,
+        weight_decay=0.01,
+        lr_scheduler_type="linear",
+        seed=3407,
+        save_strategy="no",
+    )
+
+    # --- 6. 初始化 SFTTrainer ---
+    logger.info("Initializing SFTTrainer...")
+    trainer = SFTTrainer(
+        model=model,
+        tokenizer=tokenizer,
+        train_dataset=train_1024,
+        dataset_text_field="text",
+        max_seq_length=2048,
+        # dataset_num_proc=1,
+        packing=False,
+        args=training_args,
+    )
+    trainer = train_on_responses_only(
+     trainer,
+     instruction_part="### Instruction:\n",
+     response_part="### Response:\n",
+ )
+    # --- 7. 训练 ---
+    logger.info("Starting training...")
+    trainer_stats = trainer.train()
+    print(trainer_stats)
+
+    # --- 8. 推理 (Generation) ---
+    logger.info("Starting inference...")
+    FastLanguageModel.for_inference(model)
+
+    inference_prompt = """Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
+
+### Instruction:
+Analyze the sentiment of the following movie review. Respond with 'positive' or 'negative'.
+
+### Input:
+{}
+
+### Response:
+"""
+
+    test_texts = val_dataset
+    predictions = []
+
+    for review_text in test_texts:
+        review_text2 =review_text["sentence"]
+        prompt = inference_prompt.format(review_text2)
+        inputs = tokenizer([prompt], return_tensors="pt", truncation=True, max_length=2048).to("cuda")
+
+        outputs = model.generate(**inputs, max_new_tokens=8, eos_token_id=tokenizer.eos_token_id,do_sample=False)
+        gen_ids = outputs[0][inputs["input_ids"].shape[1]:]
+        generated_text = tokenizer.decode(gen_ids, skip_special_tokens=True)
+
+        try:
+            response_part = generated_text.strip().lower()
+            print(response_part)
+            if "positive" in response_part:
+                predictions.append(1)
+            elif "negative" in response_part:
+                predictions.append(0)
+            else:
+                predictions.append(3)
+
+        except (IndexError, AttributeError):
+            logger.warning(f"Failed to parse model output: {generated_text}")
+            predictions.append(0)
+
+    # --- 9. 保存结果 ---
+    kk=0
+    gg=0
+    for review_text in test_texts:
+        if review_text['label']==predictions[kk]:
+            gg=gg+1
+        kk=kk+1
+    print(gg)
+    print(kk)
