@@ -1,0 +1,131 @@
+import evaluate
+import numpy as np
+from transformers import AutoModelForSequenceClassification, AutoTokenizer, DataCollatorWithPadding, DebertaV2Config, DebertaV2Tokenizer, Trainer, TrainingArguments
+import torch.nn as nn
+import torch
+import torch.nn.functional as F
+from datasets import concatenate_datasets,Dataset
+def create_student(teacher):
+    cof=teacher.config.to_dict()
+    cof["num_hidden_layers"]//=2
+    cof=DebertaV2Config.from_dict(cof)
+    student=type(teacher)(cof)
+    print("ddddddddddd")
+    student=copy_debert_wight(teacher,student)
+    return student
+def copy_debert_wight(teacher,student):
+    student.deberta.embeddings.load_state_dict(teacher.deberta.embeddings.state_dict())
+    teacher_layers=teacher.deberta.encoder.layer
+    student_layers=student.deberta.encoder.layer
+    student.deberta.encoder.rel_embeddings.load_state_dict(teacher.deberta.encoder.rel_embeddings.state_dict())
+    student.deberta.encoder.LayerNorm.load_state_dict(teacher.deberta.encoder.LayerNorm.state_dict())
+    for i in range(6):
+        student_layers[i].load_state_dict(teacher_layers[i*2+1].state_dict())
+    student.pooler.load_state_dict(teacher.pooler.state_dict())
+    student.classifier.load_state_dict(teacher.classifier.state_dict())
+    return student
+teacher= AutoModelForSequenceClassification.from_pretrained(
+    r"D:\liu\Desktop\知识蒸馏\w3"
+)
+student=create_student(teacher)
+class DistillationTrainer(Trainer):
+    def __init__(self,*args,teacher_model=None,**kwargs):
+        super().__init__(*args,**kwargs)
+        self.teacher=teacher_model
+        self._move_model_to_device(self.teacher,self.model.device)
+        self.teacher.eval()
+    def compute_loss(self,model,inputs,return_outputs=False,num_items_in_batch=None):
+        outputs_student=model(**inputs,output_hidden_states=True)
+        student_loss=outputs_student.loss
+        with torch.no_grad():
+            outputs_teacher=self.teacher(**inputs,output_hidden_states=True)
+        if not model.training:
+            return (
+            (student_loss, outputs_student)
+            if return_outputs
+            else student_loss
+        )
+        l4=0
+        for i in range(1,6):
+            l2=outputs_student.hidden_states[i][:,0,:].float()
+            l3=outputs_teacher.hidden_states[i*2][:,0,:].float()
+            l2 = F.normalize(l2, p=2, dim=-1)
+            l3 = F.normalize(l3, p=2, dim=-1)
+
+            l4 += F.mse_loss(l2, l3)
+
+        l4 /= 5
+    
+        fun=nn.KLDivLoss(reduction="batchmean")
+        logit=(fun(F.log_softmax(outputs_student.logits.float()/self.args.temperature,dim=-1),F.softmax(outputs_teacher.logits.float()/self.args.temperature,dim=-1))*self.args.temperature**2)
+        loss=student_loss*self.args.alpha+logit*(1-self.args.alpha)
+        return (loss,outputs_student) if return_outputs else loss
+class DistillationArguments(TrainingArguments):
+    def __init__(self,*args,alpha=0.5,temperature=2.0,**kwargs):
+        super().__init__(*args,**kwargs)
+        self.alpha=alpha
+        self.temperature=temperature
+training_args=DistillationArguments(
+    output_dir=r"D:\liu\Desktop\知识蒸馏\student_output",
+    num_train_epochs=5,
+    per_device_train_batch_size=32,
+    per_device_eval_batch_size=64,
+    warmup_ratio=0.05,
+    weight_decay=0.01,
+    logging_steps=50,
+    learning_rate=5e-5,
+    eval_strategy="epoch",
+    save_strategy="no",
+    alpha=0.2,
+    temperature=5.0,
+    bf16=True,
+)
+train_dataset = Dataset.from_file(
+    r"D:\liu\Desktop\知识蒸馏\glue-train.arrow"
+)
+val_dataset=Dataset.from_file(
+    r"D:\liu\Desktop\知识蒸馏\glue-validation.arrow"
+)
+tokenizer = DebertaV2Tokenizer(
+    vocab_file=r"D:\hf_models\deberta_v3_base\spm.model"
+)
+def preprocess_function(examples):
+    return tokenizer(examples['sentence'], truncation=True,max_length=256)
+tokenized_train = train_dataset.map(preprocess_function, batched=True)
+tokenized_val = val_dataset.map(preprocess_function, batched=True)
+neg = tokenized_train.filter(lambda x: x["label"] == 0)
+pos = tokenized_train.filter(lambda x: x["label"] == 1)
+    
+    # 各随机取 512 个
+neg = neg.shuffle(seed=42).select(range(4024))
+pos = pos.shuffle(seed=42).select(range(4024))
+    
+    # 合并
+train_1024 = concatenate_datasets([neg, pos])
+train_1024=train_1024.shuffle(seed=43)
+data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
+metric = evaluate.load("accuracy")
+
+
+def compute_metrics(eval_pred):
+    logits, labels = eval_pred
+    predictions = np.argmax(logits[0], axis=-1)
+    return metric.compute(predictions=predictions, references=labels)
+trainer=DistillationTrainer(
+    model=student,
+    args=training_args,
+    teacher_model=teacher,
+    train_dataset=train_1024,
+    eval_dataset=tokenized_val,
+    processing_class=tokenizer,
+    data_collator=data_collator,
+    compute_metrics=compute_metrics,
+)
+trainer.train()
+
+
+        
+        
+        
+
+
